@@ -46,6 +46,13 @@ function safeText(v) {
     return v;
 }
 
+function truncateMiddle(s, max = 22) {
+    if (!s || s.length <= max) return s;
+    const left = Math.ceil((max - 3) / 2);
+    const right = Math.floor((max - 3) / 2);
+    return `${s.slice(0, left)}...${s.slice(s.length - right)}`;
+}
+
 // -------------------- App --------------------
 export default function App() {
     const [session, setSession] = useState(loadSession());
@@ -67,6 +74,8 @@ export default function App() {
     const [newChatInput, setNewChatInput] = useState("");
     const [newChatBusy, setNewChatBusy] = useState(false);
 
+    const [typingUsers, setTypingUsers] = useState([]); // display names of people typing in active room
+
     const myUserId = session?.userId || null;
 
     const activeRoom = useMemo(
@@ -82,6 +91,35 @@ export default function App() {
         window.addEventListener("resize", onResize);
         return () => window.removeEventListener("resize", onResize);
     }, []);
+
+    // Sender displayname helper
+    function senderDisplayName(room, senderId) {
+        if (!room || !senderId) return senderId || "";
+        try {
+            const m = room.getMember?.(senderId);
+            const n = m?.name || m?.rawDisplayName || m?.displayName;
+            return n || senderId;
+        } catch {
+            return senderId;
+        }
+    }
+
+    // Avatar URL for room
+    function roomAvatarUrl(room, size = 64) {
+        if (!client || !room) return null;
+        try {
+            const url = room.getAvatarUrl?.(
+                client.getHomeserverUrl(),
+                size,
+                size,
+                "scale",
+                true
+            );
+            return url || null;
+        } catch {
+            return null;
+        }
+    }
 
     // Start client from session
     useEffect(() => {
@@ -111,8 +149,29 @@ export default function App() {
             if (!isMobile && !activeRoomId && rs[0]) setActiveRoomId(rs[0].roomId);
         };
 
+        const updateTypingForActive = () => {
+            if (!activeRoomId) {
+                setTypingUsers([]);
+                return;
+            }
+            const room = c.getRoom(activeRoomId);
+            if (!room) {
+                setTypingUsers([]);
+                return;
+            }
+            const typing = room.getTypingMembers?.() || [];
+            const names = typing
+                .map((m) => m?.name || m?.rawDisplayName || m?.displayName || m?.userId)
+                .filter((n) => n && (!myUserId || n !== myUserId))
+                .slice(0, 3);
+            setTypingUsers(names);
+        };
+
         const onSync = (state) => {
-            if (state === "PREPARED") updateRooms();
+            if (state === "PREPARED") {
+                updateRooms();
+                updateTypingForActive();
+            }
         };
 
         const onRoomTimeline = (ev, room, toStartOfTimeline) => {
@@ -125,29 +184,53 @@ export default function App() {
 
         const onRoom = () => updateRooms();
 
+        const onTyping = (room, member) => {
+            // Fires when somebody starts/stops typing
+            if (!room || room.roomId !== activeRoomId) return;
+            updateTypingForActive();
+        };
+
         c.on("sync", onSync);
         c.on("Room.timeline", onRoomTimeline);
         c.on("Room", onRoom);
+        c.on("RoomMember.typing", onTyping);
 
-        c.startClient({ initialSyncLimit: 20 });
+        c.startClient({ initialSyncLimit: 30 });
 
         return () => {
             c.removeListener("sync", onSync);
             c.removeListener("Room.timeline", onRoomTimeline);
             c.removeListener("Room", onRoom);
+            c.removeListener("RoomMember.typing", onTyping);
             try {
                 c.stopClient();
             } catch {}
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [session, activeRoomId, isMobile]);
+    }, [session, activeRoomId, isMobile, myUserId]);
 
-    // When room changes -> refresh events
+    // When room changes -> refresh events + typing
     useEffect(() => {
-        if (!activeRoom) return setEvents([]);
+        if (!activeRoom || !client) {
+            setEvents([]);
+            setTypingUsers([]);
+            return;
+        }
         const timeline = activeRoom.getLiveTimeline().getEvents();
         setEvents(timeline);
-    }, [activeRoomId, activeRoom]);
+
+        // refresh typing list
+        try {
+            const typing = activeRoom.getTypingMembers?.() || [];
+            const names = typing
+                .map((m) => m?.name || m?.rawDisplayName || m?.displayName || m?.userId)
+                .filter((n) => n && (!myUserId || n !== myUserId))
+                .slice(0, 3);
+            setTypingUsers(names);
+        } catch {
+            setTypingUsers([]);
+        }
+    }, [activeRoomId, activeRoom, client, myUserId]);
 
     async function login({ homeserver, username, password }) {
         const baseUrl = normalizeHomeserver(homeserver);
@@ -180,12 +263,18 @@ export default function App() {
         setActiveRoomId(null);
         setEvents([]);
         setMessage("");
+        setTypingUsers([]);
     }
 
     async function send() {
         if (!client || !activeRoomId) return;
         const text = message.trim();
         if (!text) return;
+
+        // stop typing
+        try {
+            await client.sendTyping(activeRoomId, false);
+        } catch {}
 
         const txnId = client.makeTxnId ? client.makeTxnId() : `${Date.now()}`;
         await client.sendEvent(
@@ -232,16 +321,50 @@ export default function App() {
         });
     }, [rooms, query]);
 
-    // Avatar URL for room
-    function roomAvatarUrl(room, size = 64) {
-        if (!client || !room) return null;
+    // Typing sender throttle (keep traffic low)
+    const typingTimerRef = useRef(null);
+    const typingActiveRef = useRef(false);
+
+    async function sendTyping(isTyping) {
+        if (!client || !activeRoomId) return;
+
+        // prevent spam: only send true occasionally; false on stop
         try {
-            // Room API in matrix-js-sdk usually supports this method:
-            const url = room.getAvatarUrl?.(client.getHomeserverUrl(), size, size, "scale", true);
-            return url || null;
+            if (isTyping) {
+                if (!typingActiveRef.current) {
+                    typingActiveRef.current = true;
+                    await client.sendTyping(activeRoomId, true, 4000);
+                } else {
+                    // refresh TTL
+                    await client.sendTyping(activeRoomId, true, 4000);
+                }
+            } else {
+                typingActiveRef.current = false;
+                await client.sendTyping(activeRoomId, false);
+            }
         } catch {
-            return null;
+            // ignore
         }
+    }
+
+    function onComposerChange(next) {
+        setMessage(next);
+
+        // start typing, debounce stop
+        if (!next.trim()) {
+            if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+            typingTimerRef.current = setTimeout(() => {
+                sendTyping(false);
+            }, 200);
+            return;
+        }
+
+        sendTyping(true);
+
+        if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = setTimeout(() => {
+            sendTyping(false);
+        }, 2200);
     }
 
     // -------------- render --------------
@@ -280,7 +403,9 @@ export default function App() {
                             activeRoomId={null}
                             onOpen={(id) => setActiveRoomId(id)}
                             roomAvatarUrl={roomAvatarUrl}
+                            senderDisplayName={senderDisplayName}
                             emptyHint="Пока нет чатов. Нажми New."
+                            myUserId={myUserId}
                         />
                     </div>
                 ) : (
@@ -288,10 +413,13 @@ export default function App() {
                         myUserId={myUserId}
                         room={activeRoom}
                         events={events}
+                        typingUsers={typingUsers}
                         message={message}
-                        setMessage={setMessage}
+                        setMessage={onComposerChange}
                         onSend={send}
                         onBack={() => setActiveRoomId(null)}
+                        client={client}
+                        senderDisplayName={senderDisplayName}
                     />
                 )}
 
@@ -303,7 +431,7 @@ export default function App() {
                         }}
                     >
                         <div style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
-                            Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (тогда подставится твой сервер).
+                            Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (подставится твой сервер).
                         </div>
                         <input
                             value={newChatInput}
@@ -357,7 +485,9 @@ export default function App() {
                         activeRoomId={activeRoomId}
                         onOpen={(id) => setActiveRoomId(id)}
                         roomAvatarUrl={roomAvatarUrl}
+                        senderDisplayName={senderDisplayName}
                         emptyHint="Пока нет чатов. Нажми New."
+                        myUserId={myUserId}
                     />
                 </div>
             </aside>
@@ -368,9 +498,12 @@ export default function App() {
                         myUserId={myUserId}
                         room={activeRoom}
                         events={events}
+                        typingUsers={typingUsers}
                         message={message}
-                        setMessage={setMessage}
+                        setMessage={onComposerChange}
                         onSend={send}
+                        client={client}
+                        senderDisplayName={senderDisplayName}
                     />
                 ) : (
                     <div style={{ height: "100vh", display: "grid", placeItems: "center", color: "#666" }}>
@@ -387,7 +520,7 @@ export default function App() {
                     }}
                 >
                     <div style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
-                        Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (тогда подставится твой сервер).
+                        Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (подставится твой сервер).
                     </div>
                     <input
                         value={newChatInput}
@@ -494,7 +627,7 @@ function SearchBox({ value, onChange }) {
     );
 }
 
-function RoomList({ rooms, activeRoomId, onOpen, roomAvatarUrl, emptyHint }) {
+function RoomList({ rooms, activeRoomId, onOpen, roomAvatarUrl, senderDisplayName, emptyHint, myUserId }) {
     if (!rooms.length) {
         return <div style={{ color: "#666", padding: 12 }}>{emptyHint}</div>;
     }
@@ -502,7 +635,10 @@ function RoomList({ rooms, activeRoomId, onOpen, roomAvatarUrl, emptyHint }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {rooms.map((r) => {
                 const avatar = roomAvatarUrl?.(r, 64);
-                const lastBody = r.getLastLiveEvent?.()?.getContent?.()?.body || "";
+                const lastEv = r.getLastLiveEvent?.();
+                const lastBody = lastEv?.getContent?.()?.body || "";
+                const lastSender = lastEv?.getSender?.() || "";
+                const lastSenderName = lastSender ? senderDisplayName(r, lastSender) : "";
                 const isActive = activeRoomId && r.roomId === activeRoomId;
 
                 return (
@@ -562,7 +698,9 @@ function RoomList({ rooms, activeRoomId, onOpen, roomAvatarUrl, emptyHint }) {
                                     marginTop: 2,
                                 }}
                             >
-                                {safeText(lastBody)}
+                                {safeText(lastBody)
+                                    ? `${lastSender ? (lastSender === myUserId ? "You" : truncateMiddle(lastSenderName, 18)) + ": " : ""}${safeText(lastBody)}`
+                                    : ""}
                             </div>
                         </div>
                     </div>
@@ -572,11 +710,13 @@ function RoomList({ rooms, activeRoomId, onOpen, roomAvatarUrl, emptyHint }) {
     );
 }
 
-function ChatView({ myUserId, room, events, message, setMessage, onSend, onBack }) {
+function ChatView({ myUserId, room, events, typingUsers, message, setMessage, onSend, onBack, client, senderDisplayName }) {
     const bottomRef = useRef(null);
 
     const msgEvents = useMemo(() => {
-        return (events || []).filter((e) => e.getType?.() === "m.room.message");
+        return (events || [])
+            .filter((e) => e.getType?.() === "m.room.message")
+            .filter((e) => e.getContent?.()?.msgtype === "m.text" || e.getContent?.()?.body);
     }, [events]);
 
     // Auto-scroll to bottom when new messages arrive
@@ -584,11 +724,35 @@ function ChatView({ myUserId, room, events, message, setMessage, onSend, onBack 
         bottomRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     }, [msgEvents.length, room?.roomId]);
 
+    // Send read receipt for latest message not from me
+    useEffect(() => {
+        if (!client || !room || !msgEvents.length) return;
+        const latest = [...msgEvents].reverse().find((e) => {
+            const sender = e.getSender?.();
+            return sender && sender !== myUserId;
+        });
+        if (!latest) return;
+
+        // mark as read (best-effort)
+        try {
+            if (typeof client.sendReadReceipt === "function") {
+                client.sendReadReceipt(latest);
+            } else if (typeof client.sendReceipt === "function" && latest.getId?.()) {
+                // fallback (not always available)
+                client.sendReceipt(latest, "m.read");
+            }
+        } catch {
+            // ignore
+        }
+    }, [client, room?.roomId, msgEvents.length, myUserId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const typingLine = (typingUsers || []).filter(Boolean).join(", ");
+
     return (
         <div style={{ height: "100vh", display: "flex", flexDirection: "column", minWidth: 0 }}>
             <header
                 style={{
-                    height: 56,
+                    height: 64,
                     padding: "0 12px",
                     borderBottom: "1px solid #eee",
                     display: "flex",
@@ -612,18 +776,21 @@ function ChatView({ myUserId, room, events, message, setMessage, onSend, onBack 
                         ←
                     </button>
                 ) : null}
-                <div style={{ minWidth: 0 }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                         {room?.name || "Chat"}
                     </div>
-                    <div style={{ fontSize: 12, color: "#666" }}>{room?.roomId}</div>
+                    <div style={{ fontSize: 12, color: "#666", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {typingLine ? `${typingLine} typing…` : room?.roomId}
+                    </div>
                 </div>
             </header>
 
             <div style={{ flex: 1, overflow: "auto", padding: 12, background: "#fafafa" }}>
-                {msgEvents.slice(-300).map((e) => {
+                {msgEvents.slice(-400).map((e) => {
                     const sender = e.getSender?.() || "";
                     const isMine = !!myUserId && sender === myUserId;
+                    const senderName = sender ? senderDisplayName(room, sender) : "";
                     const body = safeText(e.getContent?.()?.body);
                     const ts = e.getTs?.();
 
@@ -647,7 +814,9 @@ function ChatView({ myUserId, room, events, message, setMessage, onSend, onBack 
                                 }}
                             >
                                 {!isMine ? (
-                                    <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>{sender}</div>
+                                    <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>
+                                        {senderName || sender}
+                                    </div>
                                 ) : null}
                                 <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{body}</div>
                                 <div
