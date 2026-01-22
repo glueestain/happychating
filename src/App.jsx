@@ -1,3 +1,4 @@
+// src/App.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as sdk from "matrix-js-sdk";
 
@@ -64,7 +65,7 @@ export default function App() {
 
     const [message, setMessage] = useState("");
 
-    // UI state
+    // UI
     const [query, setQuery] = useState("");
     const [isMobile, setIsMobile] = useState(
         typeof window !== "undefined" ? window.innerWidth < 900 : false
@@ -74,7 +75,7 @@ export default function App() {
     const [newChatInput, setNewChatInput] = useState("");
     const [newChatBusy, setNewChatBusy] = useState(false);
 
-    const [typingUsers, setTypingUsers] = useState([]); // display names of people typing in active room
+    const [typingUsers, setTypingUsers] = useState([]);
 
     const myUserId = session?.userId || null;
 
@@ -92,7 +93,7 @@ export default function App() {
         return () => window.removeEventListener("resize", onResize);
     }, []);
 
-    // Sender displayname helper
+    // displayname helper
     function senderDisplayName(room, senderId) {
         if (!room || !senderId) return senderId || "";
         try {
@@ -104,7 +105,7 @@ export default function App() {
         }
     }
 
-    // Avatar URL for room
+    // room avatar helper
     function roomAvatarUrl(room, size = 64) {
         if (!client || !room) return null;
         try {
@@ -121,7 +122,7 @@ export default function App() {
         }
     }
 
-    // Start client from session
+    // Start client from session + init E2E
     useEffect(() => {
         if (!session) return;
 
@@ -145,7 +146,7 @@ export default function App() {
                 });
             setRooms(rs);
 
-            // Desktop: auto-open first room
+            // desktop auto-open first room
             if (!isMobile && !activeRoomId && rs[0]) setActiveRoomId(rs[0].roomId);
         };
 
@@ -162,7 +163,8 @@ export default function App() {
             const typing = room.getTypingMembers?.() || [];
             const names = typing
                 .map((m) => m?.name || m?.rawDisplayName || m?.displayName || m?.userId)
-                .filter((n) => n && (!myUserId || n !== myUserId))
+                .filter((n) => n)
+                .filter((n) => n !== myUserId) // грубо, но нормально для UI
                 .slice(0, 3);
             setTypingUsers(names);
         };
@@ -179,13 +181,12 @@ export default function App() {
             if (!room || room.roomId !== activeRoomId) return;
             const timeline = room.getLiveTimeline().getEvents();
             setEvents(timeline);
-            updateRooms(); // update previews
+            updateRooms();
         };
 
         const onRoom = () => updateRooms();
 
-        const onTyping = (room, member) => {
-            // Fires when somebody starts/stops typing
+        const onTyping = (room) => {
             if (!room || room.roomId !== activeRoomId) return;
             updateTypingForActive();
         };
@@ -195,7 +196,21 @@ export default function App() {
         c.on("Room", onRoom);
         c.on("RoomMember.typing", onTyping);
 
-        c.startClient({ initialSyncLimit: 30 });
+        // ВАЖНО: включаем E2E (best-effort) и только потом стартуем клиент
+        (async () => {
+            try {
+                if (typeof c.initRustCrypto === "function") {
+                    await c.initRustCrypto({
+                        useIndexedDB: true,
+                        cryptoDatabasePrefix: `happychat_${(session.userId || "u").replace(/[^a-z0-9]/gi, "_")}`,
+                    });
+                }
+            } catch (e) {
+                console.warn("E2E init failed:", e);
+            }
+
+            c.startClient({ initialSyncLimit: 30 });
+        })();
 
         return () => {
             c.removeListener("sync", onSync);
@@ -209,7 +224,7 @@ export default function App() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [session, activeRoomId, isMobile, myUserId]);
 
-    // When room changes -> refresh events + typing
+    // When room changes -> refresh events + typing list
     useEffect(() => {
         if (!activeRoom || !client) {
             setEvents([]);
@@ -219,12 +234,12 @@ export default function App() {
         const timeline = activeRoom.getLiveTimeline().getEvents();
         setEvents(timeline);
 
-        // refresh typing list
         try {
             const typing = activeRoom.getTypingMembers?.() || [];
             const names = typing
                 .map((m) => m?.name || m?.rawDisplayName || m?.displayName || m?.userId)
-                .filter((n) => n && (!myUserId || n !== myUserId))
+                .filter(Boolean)
+                .filter((n) => n !== myUserId)
                 .slice(0, 3);
             setTypingUsers(names);
         } catch {
@@ -286,6 +301,7 @@ export default function App() {
         setMessage("");
     }
 
+    // DM with E2E (m.room.encryption) — ONLY for DM
     async function startDM() {
         if (!client || !myUserId) return;
         const mxid = normalizeMxId(newChatInput, myUserId);
@@ -298,6 +314,15 @@ export default function App() {
                 is_direct: true,
                 preset: "trusted_private_chat",
                 name: `DM with ${mxid}`,
+
+                // E2E for DM
+                initial_state: [
+                    {
+                        type: "m.room.encryption",
+                        state_key: "",
+                        content: { algorithm: "m.megolm.v1.aes-sha2" },
+                    },
+                ],
             });
 
             const roomId = roomRes?.room_id || roomRes?.roomId;
@@ -321,36 +346,30 @@ export default function App() {
         });
     }, [rooms, query]);
 
-    // Typing sender throttle (keep traffic low)
+    // typing debounce/throttle
     const typingTimerRef = useRef(null);
     const typingActiveRef = useRef(false);
 
     async function sendTyping(isTyping) {
         if (!client || !activeRoomId) return;
-
-        // prevent spam: only send true occasionally; false on stop
         try {
             if (isTyping) {
                 if (!typingActiveRef.current) {
                     typingActiveRef.current = true;
                     await client.sendTyping(activeRoomId, true, 4000);
                 } else {
-                    // refresh TTL
                     await client.sendTyping(activeRoomId, true, 4000);
                 }
             } else {
                 typingActiveRef.current = false;
                 await client.sendTyping(activeRoomId, false);
             }
-        } catch {
-            // ignore
-        }
+        } catch {}
     }
 
     function onComposerChange(next) {
         setMessage(next);
 
-        // start typing, debounce stop
         if (!next.trim()) {
             if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
             typingTimerRef.current = setTimeout(() => {
@@ -379,7 +398,7 @@ export default function App() {
         color: "#111",
     };
 
-    // Mobile: either list or chat
+    // Mobile
     if (isMobile) {
         return (
             <div style={shellStyle}>
@@ -394,6 +413,7 @@ export default function App() {
                         </>
                     }
                 />
+
                 {!activeRoomId ? (
                     <div style={{ padding: 12 }}>
                         <SearchBox value={query} onChange={setQuery} />
@@ -425,14 +445,17 @@ export default function App() {
 
                 {newChatOpen ? (
                     <Modal
-                        title="New chat"
+                        title="New chat (E2E DM)"
                         onClose={() => {
                             if (!newChatBusy) setNewChatOpen(false);
                         }}
                     >
                         <div style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
                             Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (подставится твой сервер).
+                            <br />
+                            Этот DM будет создан <b>с E2E</b>.
                         </div>
+
                         <input
                             value={newChatInput}
                             onChange={(e) => setNewChatInput(e.target.value)}
@@ -441,6 +464,7 @@ export default function App() {
                             autoCorrect="off"
                             style={inputStyle}
                         />
+
                         <div style={{ height: 12 }} />
                         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                             <Btn
@@ -461,7 +485,7 @@ export default function App() {
         );
     }
 
-    // Desktop: split view
+    // Desktop
     return (
         <div style={{ ...shellStyle, display: "flex" }}>
             <aside style={sidebarStyle}>
@@ -514,14 +538,17 @@ export default function App() {
 
             {newChatOpen ? (
                 <Modal
-                    title="New chat"
+                    title="New chat (E2E DM)"
                     onClose={() => {
                         if (!newChatBusy) setNewChatOpen(false);
                     }}
                 >
                     <div style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
                         Введи Matrix ID (например <code>@user:matrix.org</code>) или просто ник (подставится твой сервер).
+                        <br />
+                        Этот DM будет создан <b>с E2E</b>.
                     </div>
+
                     <input
                         value={newChatInput}
                         onChange={(e) => setNewChatInput(e.target.value)}
@@ -530,6 +557,7 @@ export default function App() {
                         autoCorrect="off"
                         style={inputStyle}
                     />
+
                     <div style={{ height: 12 }} />
                     <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                         <Btn
@@ -550,7 +578,7 @@ export default function App() {
     );
 }
 
-// -------------------- UI pieces --------------------
+// -------------------- UI components --------------------
 const sidebarStyle = {
     width: 360,
     borderRight: "1px solid #eee",
@@ -719,12 +747,12 @@ function ChatView({ myUserId, room, events, typingUsers, message, setMessage, on
             .filter((e) => e.getContent?.()?.msgtype === "m.text" || e.getContent?.()?.body);
     }, [events]);
 
-    // Auto-scroll to bottom when new messages arrive
+    // Auto-scroll
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     }, [msgEvents.length, room?.roomId]);
 
-    // Send read receipt for latest message not from me
+    // Send read receipt (best-effort)
     useEffect(() => {
         if (!client || !room || !msgEvents.length) return;
         const latest = [...msgEvents].reverse().find((e) => {
@@ -733,18 +761,14 @@ function ChatView({ myUserId, room, events, typingUsers, message, setMessage, on
         });
         if (!latest) return;
 
-        // mark as read (best-effort)
         try {
             if (typeof client.sendReadReceipt === "function") {
                 client.sendReadReceipt(latest);
-            } else if (typeof client.sendReceipt === "function" && latest.getId?.()) {
-                // fallback (not always available)
+            } else if (typeof client.sendReceipt === "function") {
                 client.sendReceipt(latest, "m.read");
             }
-        } catch {
-            // ignore
-        }
-    }, [client, room?.roomId, msgEvents.length, myUserId]); // eslint-disable-line react-hooks/exhaustive-deps
+        } catch {}
+    }, [client, room?.roomId, msgEvents.length, myUserId]);
 
     const typingLine = (typingUsers || []).filter(Boolean).join(", ");
 
@@ -776,6 +800,7 @@ function ChatView({ myUserId, room, events, typingUsers, message, setMessage, on
                         ←
                     </button>
                 ) : null}
+
                 <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                         {room?.name || "Chat"}
@@ -818,7 +843,9 @@ function ChatView({ myUserId, room, events, typingUsers, message, setMessage, on
                                         {senderName || sender}
                                     </div>
                                 ) : null}
+
                                 <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{body}</div>
+
                                 <div
                                     style={{
                                         fontSize: 11,
