@@ -5,7 +5,7 @@ import { VitePWA } from "vite-plugin-pwa";
 
 
 export default defineConfig({
-  base: "/https://github.com/glueestain/happychating/",
+  base: "/happychating/",
   plugins: [
     react(),
     VitePWA({
