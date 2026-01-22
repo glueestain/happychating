@@ -1,0 +1,1 @@
+{"name":"HappyChat","short_name":"HappyChat","start_url":"/","display":"standalone","background_color":"#ffffff","theme_color":"#ffffff","lang":"en","scope":"/happychating/","icons":[{"src":"/happychating/pwa-192.png","sizes":"192x192","type":"image/png"},{"src":"/happychating/pwa-512.png","sizes":"512x512","type":"image/png"}]}
