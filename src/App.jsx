@@ -179,11 +179,23 @@ export default function App() {
         const onRoomTimeline = (ev, room, toStartOfTimeline) => {
             if (toStartOfTimeline) return;
             if (!room || room.roomId !== activeRoomId) return;
-            const timeline = room.getLiveTimeline().getEvents();
-            setEvents(timeline);
-            updateRooms();
-        };
 
+            // добавляем только новое событие
+            setEvents((prev) => {
+                const next = prev.concat(ev);
+                return next.length > 200 ? next.slice(next.length - 200) : next;
+            });
+
+            // updateRooms НЕ дергаем на каждое сообщение (см. C)
+        };
+        let roomsUpdateTimer = null;
+        const scheduleRoomsUpdate = () => {
+            if (roomsUpdateTimer) return;
+            roomsUpdateTimer = setTimeout(() => {
+                roomsUpdateTimer = null;
+                updateRooms();
+            }, 500);
+        };
         const onRoom = () => updateRooms();
 
         const onTyping = (room) => {
@@ -209,7 +221,11 @@ export default function App() {
                 console.warn("E2E init failed:", e);
             }
 
-            c.startClient({ initialSyncLimit: 30 });
+            c.startClient({
+                initialSyncLimit: 10,
+                lazyLoadMembers: true,
+            });
+
         })();
 
         return () => {
